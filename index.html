@@ -108,6 +108,13 @@ textarea { width: 100%; height: 120px; font-family: var(--mono); font-size: 12px
 /* 結果頁天空圖 */
 #big { width: 100%; max-width: 360px; aspect-ratio: 1; justify-self: center; display: block; }
 
+/* 衛星 AR */
+#ar { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.arrow { justify-self: center; display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+#arList { justify-self: center; font-size: 12.5px; background: rgba(0,0,0,.55); border-radius: 10px; padding: 4px 10px; max-width: 100%; text-align: center; line-height: 1.6; }
+#arList b { color: #7FE7DC; }
+#arList .blk { color: var(--bad); }
+
 /* 位置修正 */
 .distbar { justify-self: center; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: center;
   background: rgba(0,0,0,.5); padding: 5px 8px; border-radius: 12px; }
@@ -216,6 +223,7 @@ summary { cursor: pointer; color: var(--muted); font-size: 14px; }
 <!-- ═════════ 掃描 ═════════ -->
 <section id="scan" hidden>
   <video id="cam" playsinline muted autoplay></video>
+  <canvas id="ar"></canvas>
 
   <div class="hud-top">
     <canvas id="tape"></canvas>
@@ -224,6 +232,8 @@ summary { cursor: pointer; color: var(--muted); font-size: 14px; }
       <div><span class="lab">仰角</span><span id="elTxt" class="big num">--°</span></div>
     </div>
     <div id="srcChip" class="chip">等待方向感測器…</div>
+    <div class="arrow"><button id="arBtn" class="chipbtn" aria-pressed="false">顯示衛星 AR</button></div>
+    <div id="arList" hidden></div>
     <div id="distBar" class="distbar" hidden>
       <span class="lab">遮蔽物離我</span>
       <button class="chipbtn" data-d="5">5 m</button>
@@ -279,6 +289,10 @@ summary { cursor: pointer; color: var(--muted); font-size: 14px; }
         <button class="btn" data-nudge="1">方位 +1°</button>
       </div>
       <p class="hint">目前手動修正：<span id="offTxt" class="num">0.0°</span>（已含在畫面上的方位內）</p>
+      <div class="field">
+        <label for="fovIn">衛星 AR 視角：<span id="fovTxt" class="num"></span>（畫面上的衛星、天際線離準星越遠越偏時調整）</label>
+        <input id="fovIn" type="range" min="40" max="90" step="1">
+      </div>
       <div class="row">
         <button id="calReset" class="btn danger">清除手動修正</button>
         <button id="calClose" class="btn">關閉</button>
@@ -454,7 +468,7 @@ SOFTWARE.
   const S = { points: [], site: "", decl: 0, manual: 0, lat: null, lon: null, acc: null, latSrc: "",
               win: 10, utMin: 37, gwMin: 10,
               off: { on: false, D: 0, az: 0, dh: 0 },   // 位置修正：天線相對手機的位置
-              dist: 20 };                               // 目前描邊的遮蔽物距離（公尺，0＝遠）
+              dist: 20, fov: 62 };                      // fov：AR 用的相機直向視角（度）                               // 目前描邊的遮蔽物距離（公尺，0＝遠）
   function save() { try { localStorage.setItem(STORE, JSON.stringify(S)); } catch (e) {} }
   function load() {
     try { const o = JSON.parse(localStorage.getItem(STORE) || "null"); if (o && Array.isArray(o.points)) Object.assign(S, o); } catch (e) {}
@@ -472,12 +486,20 @@ SOFTWARE.
   let iosOffset = null;         // iPhone：alpha 相對值 → 以北為準 的偏移
   let vS = null;                // 平滑後的指向向量
   let lastEvtT = 0;
+  let Ms = null;                // 平滑後的旋轉矩陣（裝置 → 地面座標），衛星 AR 用
 
   function camVec(a, b, g) {
     const cA = Math.cos(a * D2R), sA = Math.sin(a * D2R), cB = Math.cos(b * D2R), sB = Math.sin(b * D2R),
           cG = Math.cos(g * D2R), sG = Math.sin(g * D2R);
     const m13 = cG * sA * sB + cA * sG, m23 = sA * sG - cA * cG * sB, m33 = cB * cG;
     return [-m13, -m23, -m33];
+  }
+  function rotMat(a, b, g) {   // W3C deviceorientation 旋轉矩陣（列優先），地面＝M·裝置
+    const cA = Math.cos(a * D2R), sA = Math.sin(a * D2R), cB = Math.cos(b * D2R), sB = Math.sin(b * D2R),
+          cG = Math.cos(g * D2R), sG = Math.sin(g * D2R);
+    return [cA * cG - sA * sB * sG, -cB * sA, cG * sA * sB + cA * sG,
+            cG * sA + cA * sB * sG, cA * cB, sA * sG - cA * cG * sB,
+            -cB * sG, sB, cB * cG];
   }
   function blendAngle(prev, next, k) {   // 角度的指數平均（處理 359→0）
     const d = ((next - prev + 540) % 360) - 180;
@@ -504,9 +526,11 @@ SOFTWARE.
       }
     }
     const v = camVec(alpha, e.beta, e.gamma);
+    const M = rotMat(alpha, e.beta, e.gamma);
     // 方向一下子轉超過 90°（例如剛開始、或校正跳動）就直接採用新值，不做平滑
-    if (!vS || vS[0] * v[0] + vS[1] * v[1] + vS[2] * v[2] < 0) vS = v;
+    if (!vS || vS[0] * v[0] + vS[1] * v[1] + vS[2] * v[2] < 0) { vS = v; Ms = M; }
     else {
+      Ms = Ms ? Ms.map((x, i) => x + (M[i] - x) * 0.25) : M;
       const k = 0.25;
       vS = [vS[0] + (v[0] - vS[0]) * k, vS[1] + (v[1] - vS[1]) * k, vS[2] + (v[2] - vS[2]) * k];
       const n = Math.hypot(vS[0], vS[1], vS[2]) || 1; vS = [vS[0] / n, vS[1] / n, vS[2] / n];
@@ -742,16 +766,17 @@ SOFTWARE.
   }
 
   // ───────── 輪廓計算 ─────────
-  function profile() {
+  function profile(raw) {   // raw＝true：不做位置修正（AR 疊圖要和相機畫面對齊）
     const bins = new Array(360).fill(null);
     for (const p0 of S.points) {
-      const p = corrected(p0); if (!p) continue;
+      const p = raw ? p0 : corrected(p0); if (!p) continue;
       const b = Math.floor(norm360(p.az)) % 360;
       const el = Math.max(0, p.el);
       bins[b] = bins[b] == null ? el : Math.max(bins[b], el);
     }
     const measured = bins.filter((x) => x != null).length;
     const out = bins.map((x) => (x == null ? 0 : x));
+    const cov = bins.map((x) => x != null);
     let filledN = 0;
     const gaps = [];
     if (measured > 0 && measured < 360) {
@@ -767,13 +792,14 @@ SOFTWARE.
         for (let j = 0; j < len; j++) {
           const idx = (m0 + k + j) % 360;
           out[idx] = len <= GAP_FILL ? lv + (rv - lv) * (j + 1) / (len + 1) : 0;
+          if (len <= GAP_FILL) cov[idx] = true;
         }
         if (len <= GAP_FILL) filledN += len;
         else gaps.push([(m0 + k) % 360, (m0 + k + len - 1) % 360]);
         k += len;
       }
     }
-    return { bins, prof: out.map((v) => +(+v).toFixed(1)),
+    return { bins, cov, prof: out.map((v) => +(+v).toFixed(1)),
              coverage: Math.round(((measured + filledN) / 360) * 100), gaps };
   }
 
@@ -884,6 +910,7 @@ SOFTWARE.
       $("covTxt").textContent = p.coverage + "%";
       $("ptsTxt").textContent = S.points.length + " 點";
       drawSky($("mini"), { small: true, cursor: true, pad: 4 });
+      if (arOn) { arCompute(Date.now()); arDraw(); }
       raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
@@ -1121,30 +1148,22 @@ SOFTWARE.
 
   // 預報範圍內的服務狀態統計與風險等級
   function windowStats(fc, win) {
-    const n = Math.min(fc.T, Math.floor(win * 60 / STEP) + 1), winEnd = fc.t0 + win * 60000;
-    let outage = 0, low = 0, zeroNM = 0, thLostObs = 0, thLost = 0, minU = 99, minPl = 99, sumU = 0, minBest = 99, cnt = 0;
+    // 只用幾何上確定的事實：某個時間點扣掉遮蔽後還有幾顆可用衛星。
+    // 不推估終端實際連哪一顆、走哪個地面站。
+    const n = Math.min(fc.T, Math.floor(win * 60 / STEP) + 1);
+    let outage = 0, single = 0, zeroNM = 0;
     for (let k = 0; k < n; k++) {
       if (fc.nNM[k] === 0) { zeroNM++; continue; }       // 星系本身的空檔，與遮蔽無關
-      cnt++; sumU += fc.nU[k];
       if (fc.nU[k] === 0) outage++;
-      if (fc.nU[k] <= 1) low++;
-      minU = Math.min(minU, fc.nU[k]); minPl = Math.min(minPl, fc.plU[k]);
-      if (!(fc.rU[k] & 1)) { thLost++; if (fc.rNM[k] & 1) thLostObs++; }
-      if (fc.bestElU[k] < minBest) minBest = fc.bestElU[k];
+      else if (fc.nU[k] === 1) single++;
     }
-    const segs = fc.segs.filter((g) => g.start < winEnd);
-    const forced = segs.filter((g) => g.imp === "best").length;
     const toMin = (c) => c * STEP / 60;
-    const st = { n, cnt, outageMin: toMin(outage), lowMin: toMin(low), zeroNMMin: toMin(zeroNM), thLostMin: toMin(thLost),
-      thLostObsMin: toMin(thLostObs), minU: cnt ? minU : 0, avgU: cnt ? sumU / cnt : 0, minPl: cnt ? minPl : 0,
-      minBest: minBest < 99 ? minBest : null, forced, segs };
+    const st = { n, outageMin: toMin(outage), singleMin: toMin(single), zeroNMMin: toMin(zeroNM) };
     const reasons = [];
     if (st.outageMin > 0) reasons.push(`有 ${fmtDur(st.outageMin * 60)} 所有可用衛星都被遮蔽，<b>會斷線</b>`);
-    if (st.lowMin > st.outageMin) reasons.push(`有 ${fmtDur((st.lowMin - st.outageMin) * 60)} 只剩 1 顆可用衛星，沒有備援`);
-    if (st.thLostObsMin > 0) reasons.push(`有 ${fmtDur(st.thLostObsMin * 60)} 因為遮蔽回不到<b>泰國</b>地面站，可能改走關島、日本（延遲上升）`);
-    if (st.forced > 0) reasons.push(`仰角最高的衛星被擋 ${st.forced} 次，終端可能需要提早換手（短暫中斷或延遲尖峰）`);
-    st.level = st.outageMin > 0 ? "high" : (reasons.length ? "mid" : "low");
-    if (!reasons.length) reasons.push(`扣掉遮蔽後，隨時至少有 ${st.minU} 顆衛星、${st.minPl} 條軌道可用，遮蔽不會影響服務`);
+    if (st.singleMin > 0) reasons.push(`有 ${fmtDur(st.singleMin * 60)} 扣掉遮蔽後只剩 1 顆可用衛星，沒有備援`);
+    st.level = st.outageMin > 0 ? "high" : st.singleMin > 0 ? "mid" : "low";
+    if (!reasons.length) reasons.push("扣掉遮蔽後，這段時間隨時都還有 2 顆以上可用衛星，遮蔽不會造成斷線");
     st.reasons = reasons;
     return st;
   }
@@ -1152,7 +1171,8 @@ SOFTWARE.
   const hhmm = (t, sec) => { const d = new Date(t), z = (n) => String(n).padStart(2, "0"); return `${z(d.getHours())}:${z(d.getMinutes())}` + (sec ? `:${z(d.getSeconds())}` : ""); };
   function fmtDur(s) { s = Math.round(s); if (s < 60) return `${s} 秒`; const m = Math.floor(s / 60), r = s % 60; if (m < 60) return r ? `${m} 分 ${r} 秒` : `${m} 分`; return `${Math.floor(m / 60)} 小時 ${m % 60} 分`; }
   const posTxt = (az, el) => `${dirWord(az)}（${Math.round(az)}°、仰角 ${Math.round(el)}°）`;
-  const IMP = { outage: ["outage", "會斷線"], best: ["best", "可能換手"], backup: ["backup", "影響小"] };
+  // 標籤只分兩種：會斷線（那一刻所有可用衛星都被擋，幾何上確定）／被擋（同時還有其他可用衛星）
+  const IMP = { outage: ["outage", "會斷線"], best: ["backup", "被擋"], backup: ["backup", "被擋"] };
   const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
   function segLine(g, winEnd) {
@@ -1173,21 +1193,10 @@ SOFTWARE.
     const LV = { low: "低", mid: "中", high: "高" };
     h += `<div class="risk ${ws.level}"><span>服務風險</span><b>${LV[ws.level]}</b></div>`;
     h += `<ul class="reasons">${ws.reasons.map((r) => `<li>${r}</li>`).join("")}</ul>`;
-    const thTxt = ws.thLostMin === 0 ? "全程可達" : `${fmtDur(ws.thLostMin * 60)}不可達`;
-    const thSub = ws.thLostMin === 0 ? "不可達時改走關島或日本"
-      : ws.thLostObsMin > 0 ? `其中 ${fmtDur(ws.thLostObsMin * 60)}是遮蔽造成，改走關島或日本` : "衛星幾何造成，與遮蔽無關";
-    h += `<div class="stats">
-      <div class="stat"><span class="k">可用衛星（扣掉遮蔽）</span><span class="v">最少 ${ws.minU} 顆</span><span class="s">平均 ${ws.avgU.toFixed(1)} 顆</span></div>
-      <div class="stat"><span class="k">同一時間可用的軌道</span><span class="v">最少 ${ws.minPl} 條</span><span class="s">扣掉遮蔽後，頭頂可用衛星分屬幾條軌道面</span></div>
-      <div class="stat"><span class="k">泰國地面站路徑</span><span class="v" style="font-size:16px">${thTxt}</span><span class="s">${thSub}</span></div>
-      <div class="stat"><span class="k">最佳可用衛星仰角</span><span class="v">${ws.minBest == null ? "—" : "最低 " + Math.round(ws.minBest) + "°"}</span><span class="s">越低越容易受雨衰影響</span></div>
-    </div>`;
     if (ws.zeroNMMin > 0) h += `<p class="hint">另有 ${fmtDur(ws.zeroNMMin * 60)} 是星系本身沒有可用衛星（與遮蔽無關）。</p>`;
     h += `<canvas id="stl"></canvas><div class="legend">
-      <span><i style="background:#3FB68B"></i>≥3 顆／≥2 條</span><span><i style="background:#D9C46A"></i>2 顆／1 條</span>
-      <span><i style="background:var(--warn)"></i>1 顆</span><span><i style="background:var(--bad)"></i>0（斷線）</span>
-      </div><div class="legend"><span>地面站路徑：</span><span><i style="background:#3FB68B"></i>可回泰國</span>
-      <span><i style="background:#8E7CC3"></i>只能走關島／日本</span><span><i style="background:var(--bad)"></i>都回不去</span></div>`;
+      <span>扣掉遮蔽後的可用衛星：</span><span><i style="background:#3FB68B"></i>2 顆以上</span>
+      <span><i style="background:var(--warn)"></i>只剩 1 顆</span><span><i style="background:var(--bad)"></i>0 顆（斷線）</span></div>`;
     h += `<p class="sub"><b>哪個方向會擋到衛星</b></p>`;
     if (!segs.length) {
       h += `<div class="banner ok">各方向都暢通：這段時間沒有衛星軌道經過遮蔽物後方。</div>`;
@@ -1211,16 +1220,14 @@ SOFTWARE.
       }
       const gTxt = (n) => { const q = gStat.get(n); return `${q.passes} 次衛星通過時被擋（同一時間最多 ${q.maxSim} 顆），合計約 ${fmtDur(q.total)}`; };
       h += `<ul class="reasons">${[...groups].map(([n]) => `<li><b>${n}</b>：${gTxt(n)}</li>`).join("")}</ul>`;
-      const worst = segs.find((g) => g.imp === "outage") || segs.find((g) => g.imp === "best");
-      if (worst && worst.imp === "outage") h += `<div class="banner bad"><b>會斷線</b>：${hhmm(worst.start, true)} 起，${worst.group}擋住衛星時，其他方向也沒有可用衛星。</div>`;
-      else if (worst) h += `<div class="banner warn"><b>需要注意</b>：${hhmm(worst.start, true)} 起，${worst.group}會擋住當下仰角最高的衛星 ${esc(worst.sat)}，終端可能要換到其他衛星。</div>`;
-      else h += `<div class="banner ok">被擋的都是備用衛星，當下仰角最高的衛星沒有被擋，預期不影響連線。</div>`;
-      h += `<canvas id="tl"></canvas><div class="legend"><span><i style="background:var(--bad)"></i>會斷線</span><span><i style="background:var(--warn)"></i>可能換手</span><span><i style="background:#D9C46A"></i>影響小</span></div>`;
+      const worst = segs.find((g) => g.imp === "outage");
+      if (worst) h += `<div class="banner bad"><b>會斷線</b>：${hhmm(worst.start, true)} 起，${worst.group}擋住衛星時，其他方向也沒有可用衛星。</div>`;
+      else h += `<div class="banner ok">每次有衛星被擋的時候，同時都還有其他可用衛星，遮蔽不會造成斷線。</div>`;
+      h += `<canvas id="tl"></canvas><div class="legend"><span><i style="background:var(--bad)"></i>會斷線</span><span><i style="background:#D9C46A"></i>被擋（同時仍有其他可用衛星）</span></div>`;
       for (const [n, gs] of groups) {
         h += `<div class="grp"><h3>${n}</h3><p class="hint" style="margin:0">${gTxt(n)}</p>${gs.slice(0, 6).map((g) => segLine(g, winEnd)).join("")}${gs.length > 6 ? `<p class="hint">…另外 ${gs.length - 6} 次</p>` : ""}</div>`;
       }
     }
-    if (fc.bestNow) h += `<p class="hint">${hhmm(fc.t0)} 當下仰角最高的衛星：${esc(fc.bestNow.sat)}，在${posTxt(fc.bestNow.az, fc.bestNow.el)}${fc.bestNow.blocked ? "，<b>正被遮蔽</b>" : "，沒有被遮蔽"}。</p>`;
     out.innerHTML = h;
     drawStatus(fc, ws.n, winEnd);
     if (segs.length) drawTimeline(segs, fc.t0, winEnd);
@@ -1230,7 +1237,7 @@ SOFTWARE.
   // 服務狀態時間軸：可用衛星數、可用軌道數、泰國路徑
   function drawStatus(fc, n, t1) {
     const cv = $("stl"); if (!cv) return;
-    const rows = ["可用衛星", "可用軌道", "地面站路徑"];
+    const rows = ["可用衛星"];
     const dpr = devicePixelRatio || 1, Wc = cv.getBoundingClientRect().width || 320, rowH = 24, top = 4, bottom = 22, left = 76;
     const Hc = top + bottom + rowH * rows.length;
     cv.style.height = Hc + "px"; cv.width = Math.round(Wc * dpr); cv.height = Math.round(Hc * dpr);
@@ -1242,9 +1249,7 @@ SOFTWARE.
     const GREEN = "#3FB68B", YEL = "#D9C46A", GW2 = "#8E7CC3", GRAY = "rgba(255,255,255,.08)";
     const colorOf = (row, k) => {
       if (fc.nNM[k] === 0) return GRAY;                                  // 星系空檔
-      if (row === 0) { const c = fc.nU[k]; return c >= 3 ? GREEN : c === 2 ? YEL : c === 1 ? col("--warn") : col("--bad"); }
-      if (row === 1) { const c = fc.plU[k]; return c >= 2 ? GREEN : c === 1 ? YEL : col("--bad"); }
-      return (fc.rU[k] & 1) ? GREEN : (fc.rU[k] & 6) ? GW2 : col("--bad");
+      const c = fc.nU[k]; return c >= 2 ? GREEN : c === 1 ? col("--warn") : col("--bad");
     };
     for (let row = 0; row < rows.length; row++) {
       let k = 0;
@@ -1271,7 +1276,7 @@ SOFTWARE.
     ctx.font = `12px ${col("--sans")}`; ctx.textBaseline = "middle";
     groups.forEach((g, i) => { ctx.fillStyle = col("--muted"); ctx.fillText(g, 0, top + rowH * i + rowH / 2);
       ctx.fillStyle = "rgba(255,255,255,.04)"; ctx.fillRect(left, top + rowH * i + 3, Wc - left - 6, rowH - 6); });
-    const C = { outage: col("--bad"), best: col("--warn"), backup: "#D9C46A" };
+    const C = { outage: col("--bad"), best: "#D9C46A", backup: "#D9C46A" };
     for (const g of segs) {
       const i = groups.indexOf(g.group), x0 = xOf(Math.max(g.start, t0)), x1 = Math.max(x0 + 2, xOf(Math.min(g.end, t1)));
       ctx.fillStyle = C[g.imp]; ctx.fillRect(x0, top + rowH * i + 5, x1 - x0, rowH - 10);
@@ -1315,9 +1320,128 @@ SOFTWARE.
     writeTleCache({ text: t, t: Date.now(), source: "手動提供", manual: true }); lastFc = null; runForecast();
   });
 
+
+  // ════════════════════════════════════════════════════════════
+  // 衛星 AR：在相機畫面上疊出頭頂的衛星、編號、仰角與未來 10 分鐘軌跡，以及掃描到的天際線
+  // ════════════════════════════════════════════════════════════
+  let arOn = false, arSats = null, arNow = [], arTracks = [], arLastPos = 0, arLastTrk = 0, arMsg = "";
+  const arCv = $("ar");
+  function arResize() { const r = arCv.getBoundingClientRect(); arCv.width = Math.round(r.width * devicePixelRatio); arCv.height = Math.round(r.height * devicePixelRatio); }
+  window.addEventListener("resize", () => { if (arOn) arResize(); });
+  async function arEnsureSats() {
+    if (arSats) return true;
+    try { const t = await loadTle(); arSats = parseTle(t.text); return arSats.length > 0; }
+    catch (e) { arMsg = "抓不到衛星軌道資料，請確認網路"; return false; }
+  }
+  $("arBtn").addEventListener("click", async () => {
+    arOn = !arOn; $("arBtn").setAttribute("aria-pressed", String(arOn));
+    $("arBtn").textContent = arOn ? "隱藏衛星 AR" : "顯示衛星 AR";
+    $("arList").hidden = !arOn;
+    if (arOn) { arResize(); arMsg = "載入衛星軌道資料…"; if (await arEnsureSats()) arMsg = ""; arLastPos = arLastTrk = 0; }
+    else { arCv.getContext("2d").clearRect(0, 0, arCv.width, arCv.height); }
+  });
+  function lookAt(rec, date, obs) {
+    let pv; try { pv = satellite.propagate(rec, date); } catch (e) { return null; }
+    if (!pv || !pv.position) return null;
+    const la = satellite.ecfToLookAngles(obs, satellite.eciToEcf(pv.position, satellite.gstime(date)));
+    return { az: norm360(la.azimuth * R2D), el: la.elevation * R2D };
+  }
+  function arCompute(now) {
+    if (!arSats || S.lat == null) return;
+    const obs = { latitude: S.lat * D2R, longitude: S.lon * D2R, height: 0 };
+    const prof = profile().prof, utMin = S.utMin || 37;
+    if (now - arLastPos > 1000) {           // 每秒更新目前位置
+      arLastPos = now; const d = new Date(now); const out = [];
+      for (const s0 of arSats) { const p = lookAt(s0.rec, d, obs); if (p && p.el > -2) out.push({ name: s0.name, rec: s0.rec, ...p }); }
+      for (const q of out) { q.usable = q.el >= utMin; q.blocked = q.el < maskAt(prof, q.az); }
+      arNow = out;
+      const vis = out.filter((q) => q.el >= utMin).sort((a, b) => b.el - a.el).slice(0, 5);
+      $("arList").innerHTML = vis.length
+        ? "頭頂可用衛星：" + vis.map((q) => `${dirWord(q.az)} <b>${esc(q.name.replace("ONEWEB-", "OW-"))}</b> ${Math.round(q.el)}°${q.blocked ? '<span class="blk">（被擋）</span>' : ""}`).join("｜")
+        : `目前沒有仰角 ≥ ${utMin}° 的衛星`;
+    }
+    if (now - arLastTrk > 10000) {          // 每 10 秒更新未來 10 分鐘軌跡
+      arLastTrk = now; const tr = [];
+      for (const q of arNow) {
+        const pts = [];
+        for (let m = 0; m <= 600; m += 30) { const p = lookAt(q.rec, new Date(now + m * 1000), obs); if (p) pts.push({ ...p, m }); }
+        if (pts.some((p) => p.el > 0)) tr.push({ name: q.name, pts });
+      }
+      arTracks = tr;
+    }
+  }
+  // 地面座標方向 → 螢幕座標（看不到時回傳 null）
+  function project(az, el, W, H) {
+    if (!Ms) return null;
+    const off = Number(S.decl || 0) + S.manual;               // 畫面上的方位含磁偏角與手動修正，換回感測器座標
+    const a = (az - off) * D2R, e = el * D2R;
+    const wx = Math.cos(e) * Math.sin(a), wy = Math.cos(e) * Math.cos(a), wz = Math.sin(e);
+    const m = Ms;
+    const dx = m[0] * wx + m[3] * wy + m[6] * wz, dy = m[1] * wx + m[4] * wy + m[7] * wz, dz = m[2] * wx + m[5] * wy + m[8] * wz;
+    const depth = -dz; if (depth < 0.15) return null;          // 在鏡頭後方
+    const ang = ((screen.orientation && screen.orientation.angle) || window.orientation || 0) * D2R;
+    const sx = dx * Math.cos(ang) - dy * Math.sin(ang), sy = dx * Math.sin(ang) + dy * Math.cos(ang);
+    const f = (Math.max(W, H) / 2) / Math.tan((S.fov || 62) * D2R / 2);
+    return [W / 2 + f * sx / depth, H / 2 - f * sy / depth];
+  }
+  function arDraw() {
+    const ctx = arCv.getContext("2d"), W = arCv.width, H = arCv.height, dpr = devicePixelRatio || 1;
+    ctx.clearRect(0, 0, W, H);
+    if (!arOn) return;
+    ctx.font = `${12 * dpr}px ${getComputedStyle(document.documentElement).getPropertyValue("--sans")}`;
+    if (arMsg || S.lat == null || !Ms) {
+      const t = arMsg || (S.lat == null ? "等待 GPS 位置才能顯示衛星…" : "等待方向感測器…");
+      ctx.fillStyle = "rgba(0,0,0,.6)"; ctx.fillRect(W / 2 - 150 * dpr, H * 0.62, 300 * dpr, 28 * dpr);
+      ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(t, W / 2, H * 0.62 + 14 * dpr); return;
+    }
+    // 掃描到的天際線（虛線）
+    const rp = profile(true), rb = rp.prof.map((v, i) => (rp.cov[i] ? v : null));
+    ctx.setLineDash([6 * dpr, 5 * dpr]); ctx.lineWidth = 2 * dpr; ctx.strokeStyle = "rgba(255,255,255,.75)";
+    let pen = false; ctx.beginPath();
+    for (let a = 0; a <= 360; a++) {
+      const v = rb[a % 360]; const p = v == null ? null : project(a, v, W, H);
+      if (!p) { pen = false; continue; }
+      if (pen) ctx.lineTo(p[0], p[1]); else { ctx.moveTo(p[0], p[1]); pen = true; }
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+    // 終端最低仰角的圓（細虛線）
+    ctx.strokeStyle = "rgba(242,165,65,.6)"; ctx.lineWidth = 1 * dpr; ctx.setLineDash([3 * dpr, 6 * dpr]); ctx.beginPath(); pen = false;
+    for (let a = 0; a <= 360; a += 2) { const p = project(a, S.utMin || 37, W, H); if (!p) { pen = false; continue; } if (pen) ctx.lineTo(p[0], p[1]); else { ctx.moveTo(p[0], p[1]); pen = true; } }
+    ctx.stroke(); ctx.setLineDash([]);
+    const prof = profile().prof, utMin = S.utMin || 37;
+    // 未來 10 分鐘軌跡：可用（藍綠）、被遮蔽（紅）、低於終端仰角（灰）
+    for (const t of arTracks) {
+      for (let i = 1; i < t.pts.length; i++) {
+        const a0 = t.pts[i - 1], a1 = t.pts[i];
+        if (a0.el < 0 && a1.el < 0) continue;
+        const p0 = project(a0.az, a0.el, W, H), p1 = project(a1.az, a1.el, W, H); if (!p0 || !p1) continue;
+        const mid = { az: a1.az, el: a1.el };
+        ctx.strokeStyle = mid.el < utMin ? "rgba(200,210,214,.45)" : mid.el < maskAt(prof, mid.az) ? "rgba(239,106,94,.9)" : "rgba(127,231,220,.9)";
+        ctx.lineWidth = (mid.el < utMin ? 1.5 : 2.5) * dpr; ctx.beginPath(); ctx.moveTo(p0[0], p0[1]); ctx.lineTo(p1[0], p1[1]); ctx.stroke();
+        if (a1.m % 300 === 0 && a1.m > 0 && a1.el >= utMin) { ctx.fillStyle = "rgba(255,255,255,.85)"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillText(`+${a1.m / 60}分`, p1[0] + 5 * dpr, p1[1]); }
+      }
+    }
+    // 目前位置
+    for (const q of arNow) {
+      if (q.el < 0) continue;
+      const p = project(q.az, q.el, W, H); if (!p) continue;
+      const c = !q.usable ? "rgba(200,210,214,.75)" : q.blocked ? "#EF6A5E" : "#7FE7DC";
+      ctx.fillStyle = c; ctx.strokeStyle = "rgba(0,0,0,.6)"; ctx.lineWidth = 2 * dpr;
+      ctx.beginPath(); ctx.arc(p[0], p[1], (q.usable ? 7 : 4) * dpr, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+      if (q.usable || q.el > 20) {
+        const label = `${q.name.replace("ONEWEB-", "OW-")}  ${Math.round(q.el)}°` + (q.usable && q.blocked ? " 被擋" : "");
+        ctx.textAlign = "left"; ctx.textBaseline = "bottom"; ctx.lineWidth = 3 * dpr; ctx.strokeStyle = "rgba(0,0,0,.75)";
+        ctx.strokeText(label, p[0] + 9 * dpr, p[1] - 4 * dpr); ctx.fillStyle = c; ctx.fillText(label, p[0] + 9 * dpr, p[1] - 4 * dpr);
+      }
+    }
+  }
+  const fovIn = $("fovIn");
+  fovIn.value = S.fov || 62; $("fovTxt").textContent = (S.fov || 62) + "°";
+  fovIn.addEventListener("input", () => { S.fov = +fovIn.value; $("fovTxt").textContent = S.fov + "°"; save(); });
+
   // 給測試用：模擬感測器（網址加 #demo）
   if (location.hash === "#demo") {
-    window.__scanTest = { onOri, profile, current, S, addPoint, showResult, runForecast, corrected, get fc() { return lastFc; } };
+    window.__scanTest = { onOri, profile, current, S, addPoint, showResult, runForecast, corrected, project, get fc() { return lastFc; }, get arNow() { return arNow; }, get arTracks() { return arTracks; } };
   }
 })();
 </script>
