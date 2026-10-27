@@ -1,0 +1,35 @@
+# 每 6 小時從 CelesTrak 下載 OneWeb 軌道資料（TLE），存成 oneweb.txt。
+# 遮蔽掃描頁會優先讀同一個網站上的 oneweb.txt，手機就不用直接連 CelesTrak。
+name: Update OneWeb TLE
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"    # UTC 每 6 小時（台灣時間 08:17、14:17、20:17、02:17）
+  workflow_dispatch:           # 也可以在 Actions 頁面手動按 Run workflow
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download OneWeb TLE from CelesTrak
+        run: |
+          curl -fsSL --retry 3 --retry-delay 10 \
+            "https://celestrak.org/NORAD/elements/gp.php?GROUP=oneweb&FORMAT=tle" -o oneweb.tmp
+          n=$(grep -c '^1 ' oneweb.tmp || true)
+          echo "satellites: $n"
+          if [ "$n" -lt 100 ]; then echo "TLE 內容不正確，保留舊檔"; exit 1; fi
+          mv oneweb.tmp oneweb.txt
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898732+github-actions[bot]@users.noreply.github.com"
+          git add oneweb.txt
+          if git diff --cached --quiet; then echo "沒有變更"; exit 0; fi
+          git commit -m "Update OneWeb TLE $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
