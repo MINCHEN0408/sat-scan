@@ -108,6 +108,13 @@ textarea { width: 100%; height: 120px; font-family: var(--mono); font-size: 12px
 /* 結果頁天空圖 */
 #big { width: 100%; max-width: 360px; aspect-ratio: 1; justify-self: center; display: block; }
 
+/* 自動辨識天空 */
+#segov { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.autobar { justify-self: center; display: grid; gap: 4px; justify-items: center; background: rgba(0,0,0,.55); border-radius: 12px; padding: 6px 10px; max-width: 100%; }
+.autobar .row2 { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; align-items: center; }
+.autobar .st { font-size: 12px; color: var(--fg); text-align: center; }
+.autobar .tip { font-size: 11.5px; color: var(--muted); text-align: center; }
+
 /* 衛星 AR */
 #ar { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .arrow { justify-self: center; display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
@@ -223,6 +230,7 @@ summary { cursor: pointer; color: var(--muted); font-size: 14px; }
 <!-- ═════════ 掃描 ═════════ -->
 <section id="scan" hidden>
   <video id="cam" playsinline muted autoplay></video>
+  <canvas id="segov"></canvas>
   <canvas id="ar"></canvas>
 
   <div class="hud-top">
@@ -232,7 +240,20 @@ summary { cursor: pointer; color: var(--muted); font-size: 14px; }
       <div><span class="lab">仰角</span><span id="elTxt" class="big num">--°</span></div>
     </div>
     <div id="srcChip" class="chip">等待方向感測器…</div>
-    <div class="arrow"><button id="arBtn" class="chipbtn" aria-pressed="false">顯示衛星 AR</button></div>
+    <div class="arrow">
+      <button id="autoBtn" class="chipbtn" aria-pressed="false">自動辨識天空</button>
+      <button id="arBtn" class="chipbtn" aria-pressed="false">顯示衛星 AR</button>
+    </div>
+    <div id="autoBar" class="autobar" hidden>
+      <div class="row2">
+        <span class="tip">辨識方式</span>
+        <button class="chipbtn" data-amode="color" aria-pressed="true">顏色（快）</button>
+        <button class="chipbtn" data-amode="ai" aria-pressed="false">AI（準、較慢）</button>
+        <button class="chipbtn" id="autoClear">清除自動結果</button>
+      </div>
+      <div id="autoSt" class="st"></div>
+      <div class="tip">手機往上抬，讓畫面同時有天空和遮蔽物，慢慢轉一圈；再抬高一點轉第二圈。紅色＝判斷為遮蔽物。</div>
+    </div>
     <div id="arList" hidden></div>
     <div id="distBar" class="distbar" hidden>
       <span class="lab">遮蔽物離我</span>
@@ -345,6 +366,7 @@ summary { cursor: pointer; color: var(--muted); font-size: 14px; }
         <dt>天空遮蔽率</dt><dd id="rObs" class="num"></dd>
         <dt>覆蓋率</dt><dd id="rCov" class="num"></dd>
         <dt>記錄點數</dt><dd id="rPts" class="num"></dd>
+        <dt>自動辨識</dt><dd id="rAuto"></dd>
         <dt>磁偏角修正</dt><dd id="rDecl" class="num"></dd>
         <dt>位置修正</dt><dd id="rOff"></dd>
       </dl>
@@ -468,7 +490,8 @@ SOFTWARE.
   const S = { points: [], site: "", decl: 0, manual: 0, lat: null, lon: null, acc: null, latSrc: "",
               win: 10, utMin: 37, gwMin: 10,
               off: { on: false, D: 0, az: 0, dh: 0 },   // 位置修正：天線相對手機的位置
-              dist: 20, fov: 62 };                      // fov：AR 用的相機直向視角（度）                               // 目前描邊的遮蔽物距離（公尺，0＝遠）
+              dist: 20, fov: 62,
+              autoProf: null };                         // 自動辨識得到的輪廓（每 1° 一個仰角，null＝沒看到）                      // fov：AR 用的相機直向視角（度）                               // 目前描邊的遮蔽物距離（公尺，0＝遠）
   function save() { try { localStorage.setItem(STORE, JSON.stringify(S)); } catch (e) {} }
   function load() {
     try { const o = JSON.parse(localStorage.getItem(STORE) || "null"); if (o && Array.isArray(o.points)) Object.assign(S, o); } catch (e) {}
@@ -774,6 +797,17 @@ SOFTWARE.
       const el = Math.max(0, p.el);
       bins[b] = bins[b] == null ? el : Math.max(bins[b], el);
     }
+    // 手動描邊沒有涵蓋的方位，用自動辨識的結果補上（手動優先）
+    if (S.autoProf) {
+      const ab = new Array(360).fill(null);
+      for (let i = 0; i < 360; i++) {
+        const v = S.autoProf[i]; if (v == null) continue;
+        const p0 = { az: i + 0.5, el: v, d: 0 }, p = raw ? p0 : corrected(p0); if (!p) continue;
+        const b = Math.floor(norm360(p.az)) % 360, el = Math.max(0, p.el);
+        ab[b] = ab[b] == null ? el : Math.max(ab[b], el);
+      }
+      for (let i = 0; i < 360; i++) if (bins[i] == null && ab[i] != null) bins[i] = ab[i];
+    }
     const measured = bins.filter((x) => x != null).length;
     const out = bins.map((x) => (x == null ? 0 : x));
     const cov = bins.map((x) => x != null);
@@ -910,6 +944,7 @@ SOFTWARE.
       $("covTxt").textContent = p.coverage + "%";
       $("ptsTxt").textContent = S.points.length + " 點";
       drawSky($("mini"), { small: true, cursor: true, pad: 4 });
+      if (AUTO.on) autoTick(performance.now());
       if (arOn) { arCompute(Date.now()); arDraw(); }
       raf = requestAnimationFrame(step);
     };
@@ -950,7 +985,9 @@ SOFTWARE.
     $("resLead").textContent = "灰色是遮蔽範圍（中心是天頂，外圈是地平線），外圈綠色弧線是有量到的方位，橘色虛線是終端最低仰角 37°。";
     $("rCov").textContent = p.coverage + "%";
     $("rObs").textContent = obsText(p.prof);
-    $("rPts").textContent = S.points.length + " 點";
+    $("rPts").textContent = S.points.length + " 點（手動描邊）";
+    const an = S.autoProf ? S.autoProf.filter((v) => v != null).length : 0;
+    $("rAuto").textContent = an ? `${Math.round(an / 3.6)}% 方位有自動辨識結果（手動描過的方位以手動為準）` : "沒有使用";
     $("rDecl").textContent = `${S.decl}°（手動修正 ${S.manual}°）`;
     $("rOff").textContent = offText();
     const gw = $("gapWarn");
@@ -1321,6 +1358,207 @@ SOFTWARE.
   });
 
 
+
+  // ════════════════════════════════════════════════════════════
+  // 自動辨識天空：每一幀判斷哪些像素是天空，換算成方位／仰角後累積投票，自動得出遮蔽輪廓
+  // ════════════════════════════════════════════════════════════
+  const GEL = 91;                                   // 仰角 0..90，每 1° 一格
+  const gSky = new Uint16Array(360 * GEL), gObj = new Uint16Array(360 * GEL);
+  const AUTO = { on: false, mode: "color", busy: false, last: 0, frames: 0, fpsT: 0, fpsN: 0, fps: 0,
+                 aiPipe: null, aiState: "", lastProf: 0, prevV: null, prevT: 0, speed: 0 };
+  const segCv = document.createElement("canvas"), segCtx = segCv.getContext("2d", { willReadFrequently: true });
+  const ovSmall = document.createElement("canvas");
+  const ovCv = $("segov");
+  let rayCache = null;   // 每個像素在手機座標中的方向（依畫面大小、視角、螢幕方向快取）
+
+  function autoStatus() {
+    const an = S.autoProf ? S.autoProf.filter((v) => v != null).length : 0;
+    let t = `已辨識 ${Math.round(an / 3.6)}% 方位`;
+    if (AUTO.mode === "ai") t += AUTO.aiState ? `　${AUTO.aiState}` : `　AI 每秒 ${AUTO.fps.toFixed(1)} 張`;
+    else t += `　每秒 ${AUTO.fps.toFixed(0)} 張`;
+    if (AUTO.speed > 40) t += "　<b style='color:var(--warn)'>轉太快了，請放慢</b>";
+    if (AUTO.note) t += `<br><span style="color:var(--warn)">${AUTO.note}</span>`;
+    $("autoSt").innerHTML = t;
+  }
+  function setAutoMode(m) {
+    AUTO.mode = m; AUTO.note = "";
+    document.querySelectorAll("[data-amode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.amode === m)));
+    if (m === "ai") loadAi();
+  }
+  document.querySelectorAll("[data-amode]").forEach((b) => b.addEventListener("click", () => setAutoMode(b.dataset.amode)));
+  $("autoBtn").addEventListener("click", () => {
+    AUTO.on = !AUTO.on; $("autoBtn").setAttribute("aria-pressed", String(AUTO.on));
+    $("autoBtn").textContent = AUTO.on ? "停止自動辨識" : "自動辨識天空";
+    $("autoBar").hidden = !AUTO.on;
+    if (AUTO.on) { ovResize(); autoStatus(); } else { ovCv.getContext("2d").clearRect(0, 0, ovCv.width, ovCv.height); save(); }
+  });
+  $("autoClear").addEventListener("click", () => { gSky.fill(0); gObj.fill(0); S.autoProf = null; save(); autoStatus(); });
+  function ovResize() { const r = ovCv.getBoundingClientRect(); ovCv.width = Math.round(r.width * devicePixelRatio); ovCv.height = Math.round(r.height * devicePixelRatio); }
+  window.addEventListener("resize", () => { if (AUTO.on) ovResize(); });
+
+  // AI 模型：SegFormer-B0（ADE20K，含「天空」類別），用 Transformers.js 在瀏覽器裡執行
+  async function loadAi() {
+    if (AUTO.aiPipe || AUTO.aiState.startsWith("下載")) return;
+    AUTO.aiState = "下載 AI 模型中…（第一次約需數十秒）"; autoStatus();
+    try {
+      const T = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6/dist/transformers.min.js");
+      const opts = { progress_callback: (e) => {
+        if (e.status === "progress" && e.total) { AUTO.aiState = `下載 AI 模型中… ${Math.round(e.loaded / e.total * 100)}%`; autoStatus(); }
+      } };
+      let pipe = null;
+      if (navigator.gpu) { try { pipe = await T.pipeline("image-segmentation", "Xenova/segformer-b0-finetuned-ade-512-512", { ...opts, device: "webgpu" }); } catch (e) { pipe = null; } }
+      if (!pipe) pipe = await T.pipeline("image-segmentation", "Xenova/segformer-b0-finetuned-ade-512-512", opts);
+      AUTO.aiPipe = pipe; AUTO.aiState = "";
+    } catch (e) {
+      AUTO.aiState = "";
+      AUTO.note = "AI 模型下載失敗（請確認網路），已改用顏色辨識。" + (e && e.message ? "原因：" + e.message.slice(0, 60) : "");
+      AUTO.mode = "color"; document.querySelectorAll("[data-amode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.amode === "color")));
+    }
+    autoStatus();
+  }
+
+  function buildRays(w, h) {
+    const ang = ((screen.orientation && screen.orientation.angle) || window.orientation || 0);
+    const key = `${w}x${h}@${S.fov}@${ang}`;
+    if (rayCache && rayCache.key === key) return rayCache;
+    const f = (Math.max(w, h) / 2) / Math.tan((S.fov || 62) * D2R / 2), c = Math.cos(ang * D2R), sn = Math.sin(ang * D2R);
+    const dx = new Float32Array(w * h), dy = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const sx = x + 0.5 - w / 2, sy = -(y + 0.5 - h / 2), i = y * w + x;
+      dx[i] = sx * c + sy * sn; dy[i] = -sx * sn + sy * c;     // 螢幕座標 → 手機座標（與 project() 互為反運算）
+    }
+    rayCache = { key, w, h, dx, dy, dz: -f };
+    return rayCache;
+  }
+
+  // 顏色規則：天空＝亮、紋理少，而且「色調」接近這一幀裡高仰角處的天空顏色。
+  // 只看亮不亮會把淺灰牆、水塔誤認成天空，所以先從仰角 ≥ 35° 的平滑亮區估出天空的色調當參考。
+  function classifyColor(data, w, h, el) {
+    const n = w * h, L = new Float32Array(n), G = new Float32Array(n);
+    for (let i = 0; i < n; i++) L[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) { const i = y * w + x; G[i] = Math.abs(L[i + 1] - L[i - 1]) + Math.abs(L[i + w] - L[i - w]); }
+    const pool = []; for (let i = 0; i < n; i += 2) if (el[i] >= 30) pool.push(L[i]);
+    const src = pool.length >= 60 ? pool : Array.from(L.filter((_, i) => i % 3 === 0));
+    src.sort((a, b) => a - b);
+    const Lref = src[Math.floor(src.length * 0.9)] || 200;
+    // 天空參考色調（正規化 rgb）：仰角 ≥ 35°、亮、平滑的像素取中位數
+    const cr = [], cg = [], cb = [];
+    for (let i = 0; i < n; i += 2) {
+      if (el[i] < 35 || G[i] > 14 || L[i] < 0.75 * Lref) continue;
+      const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2], sm = r + g + b || 1;
+      cr.push(r / sm); cg.push(g / sm); cb.push(b / sm);
+    }
+    const med = (a) => { a.sort((x, y) => x - y); return a[Math.floor(a.length / 2)]; };
+    const ref = cr.length >= 40 ? [med(cr), med(cg), med(cb)] : null;
+    const neutral = !ref || (Math.max(...ref) - Math.min(...ref) < 0.05);   // 陰天：天空本身是灰白色，色調幫不上忙
+    const sky = new Uint8Array(n);
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x, r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2], sm = r + g + b || 1;
+      if (G[i] >= 22) continue;
+      if (neutral) {
+        // 陰天：只能靠「夠亮」區分（牆面通常比陰天的天空暗），門檻提高
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b), sat = mx ? (mx - mn) / mx : 0;
+        sky[i] = L[i] > Math.max(0.82 * Lref, 110) && sat < 0.22 ? 1 : 0;
+      } else {
+        const d = Math.hypot(r / sm - ref[0], g / sm - ref[1], b / sm - ref[2]);
+        sky[i] = L[i] > Math.max(0.55 * Lref, 80) && d < 0.06 ? 1 : (L[i] > 230 && G[i] < 12 ? 1 : 0);   // 很亮又平滑（雲、太陽附近）也算天空
+      }
+    }
+    return sky;
+  }
+
+  async function autoTick(now) {
+    if (!AUTO.on || AUTO.busy || !Ms) return;
+    const vid = $("cam"); if (!vid.videoWidth) { $("autoSt").textContent = "等待相機畫面…"; return; }
+    // 轉動速度（度／秒）：太快會模糊、感測器也跟不上，先跳過
+    if (vS) {
+      if (AUTO.prevV && now > AUTO.prevT) {
+        const d = Math.acos(Math.max(-1, Math.min(1, vS[0] * AUTO.prevV[0] + vS[1] * AUTO.prevV[1] + vS[2] * AUTO.prevV[2]))) * R2D;
+        AUTO.speed = AUTO.speed * 0.7 + (d / ((now - AUTO.prevT) / 1000)) * 0.3;
+      }
+      AUTO.prevV = vS.slice(); AUTO.prevT = now;
+    }
+    const minGap = AUTO.mode === "ai" ? 0 : 120;
+    if (now - AUTO.last < minGap || AUTO.speed > 40) { autoStatus(); return; }
+    if (AUTO.mode === "ai" && !AUTO.aiPipe) { autoStatus(); return; }
+    AUTO.busy = true; AUTO.last = now;
+    try {
+      const vw = vid.videoWidth, vh = vid.videoHeight, long = AUTO.mode === "ai" ? 256 : 160, sc = long / Math.max(vw, vh);
+      const w = Math.max(8, Math.round(vw * sc)), h = Math.max(8, Math.round(vh * sc));
+      if (segCv.width !== w || segCv.height !== h) { segCv.width = w; segCv.height = h; }
+      segCtx.drawImage(vid, 0, 0, w, h);
+      const M = Ms.slice(), off = Number(S.decl || 0) + S.manual;    // 拍到這一幀時的手機姿態
+      const R = buildRays(w, h), n = w * h;
+      const az = new Float32Array(n), el = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const dx = R.dx[i], dy = R.dy[i], dz = R.dz;
+        const wx = M[0] * dx + M[1] * dy + M[2] * dz, wy = M[3] * dx + M[4] * dy + M[5] * dz, wz = M[6] * dx + M[7] * dy + M[8] * dz;
+        const len = Math.hypot(wx, wy, wz);
+        el[i] = Math.asin(wz / len) * R2D; az[i] = norm360(Math.atan2(wx, wy) * R2D + off);
+      }
+      let sky;
+      if (AUTO.mode === "ai") {
+        const out = await AUTO.aiPipe(segCv);
+        const sk = (out || []).find((o) => String(o.label).toLowerCase() === "sky");
+        sky = new Uint8Array(n);
+        if (sk && sk.mask) {
+          const mw = sk.mask.width, mh = sk.mask.height, md = sk.mask.data;
+          for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+            const mx2 = Math.min(mw - 1, Math.floor(x * mw / w)), my2 = Math.min(mh - 1, Math.floor(y * mh / h));
+            sky[y * w + x] = md[my2 * mw + mx2] > 127 ? 1 : 0;
+          }
+        }
+      } else {
+        sky = classifyColor(segCtx.getImageData(0, 0, w, h).data, w, h, el);
+      }
+      // 投票
+      for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+        const i = y * w + x; if (el[i] < 0) continue;
+        const c = Math.floor(az[i]) % 360 * GEL + Math.min(90, Math.floor(el[i]));
+        if (sky[i]) { if (gSky[c] < 65000) gSky[c]++; } else if (gObj[c] < 65000) gObj[c]++;
+      }
+      // 即時回饋：把判斷為遮蔽物的像素染紅（與相機畫面相同的裁切方式）
+      if (ovSmall.width !== w || ovSmall.height !== h) { ovSmall.width = w; ovSmall.height = h; }
+      const oc = ovSmall.getContext("2d"), img = oc.createImageData(w, h);
+      for (let i = 0; i < n; i++) if (!sky[i] && el[i] >= 0) { img.data[i * 4] = 239; img.data[i * 4 + 1] = 70; img.data[i * 4 + 2] = 60; img.data[i * 4 + 3] = 95; }
+      oc.putImageData(img, 0, 0);
+      const ctx = ovCv.getContext("2d"), W = ovCv.width, H = ovCv.height, k = Math.max(W / w, H / h);
+      ctx.clearRect(0, 0, W, H); ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(ovSmall, (W - w * k) / 2, (H - h * k) / 2, w * k, h * k);
+      AUTO.frames++; AUTO.fpsN++;
+      if (now - AUTO.fpsT > 1000) { AUTO.fps = AUTO.fpsN * 1000 / (now - AUTO.fpsT); AUTO.fpsN = 0; AUTO.fpsT = now; }
+      if (now - AUTO.lastProf > 400) { updateAutoProf(); AUTO.lastProf = now; }
+    } catch (e) {
+      AUTO.aiState = "辨識錯誤：" + (e && e.message ? e.message.slice(0, 60) : e);
+    } finally { AUTO.busy = false; autoStatus(); }
+  }
+
+  // 由投票格子得出每個方位的遮蔽仰角：從地平線往上，遮蔽物佔多數的格子連續延伸到哪裡；
+  // 往上遇到連續 3° 以上的天空就停（避免電線、飛鳥、雲造成的零星誤判）
+  function updateAutoProf() {
+    const prof = S.autoProf ? S.autoProf.slice() : new Array(360).fill(null);
+    for (let a = 0; a < 360; a++) {
+      let last = -1, skyRun = 0, seen = false;
+      for (let e = 0; e <= 90; e++) {
+        const c = a * GEL + e, sv = gSky[c], ov = gObj[c], nn = sv + ov;
+        if (nn < 2) continue;
+        seen = true;
+        if (ov / nn >= 0.5) { last = e; skyRun = 0; }
+        else if (++skyRun >= 3) break;
+      }
+      if (seen) prof[a] = last >= 0 ? last + 1 : 0;
+    }
+    // 相鄰 5° 取中位數：修掉單一方位的零星誤判（遮蔽物的上緣在方位上是連續的）
+    const sm = prof.slice();
+    for (let a = 0; a < 360; a++) {
+      if (prof[a] == null) continue;
+      const w = []; for (let k = -2; k <= 2; k++) { const v = prof[(a + k + 360) % 360]; if (v != null) w.push(v); }
+      if (w.length >= 3) { w.sort((x, y) => x - y); sm[a] = w[Math.floor(w.length / 2)]; }
+    }
+    S.autoProf = sm;
+    if (performance.now() - (AUTO.savedT || 0) > 3000) { save(); AUTO.savedT = performance.now(); }
+  }
+
   // ════════════════════════════════════════════════════════════
   // 衛星 AR：在相機畫面上疊出頭頂的衛星、編號、仰角與未來 10 分鐘軌跡，以及掃描到的天際線
   // ════════════════════════════════════════════════════════════
@@ -1441,7 +1679,8 @@ SOFTWARE.
 
   // 給測試用：模擬感測器（網址加 #demo）
   if (location.hash === "#demo") {
-    window.__scanTest = { onOri, profile, current, S, addPoint, showResult, runForecast, corrected, project, get fc() { return lastFc; }, get arNow() { return arNow; }, get arTracks() { return arTracks; } };
+    window.__scanTest = { onOri, profile, current, S, addPoint, showResult, runForecast, corrected, project, AUTO, updateAutoProf,
+      get Ms() { return Ms; }, get fc() { return lastFc; }, get arNow() { return arNow; }, get arTracks() { return arTracks; } };
   }
 })();
 </script>
